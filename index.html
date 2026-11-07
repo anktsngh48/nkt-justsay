@@ -401,11 +401,56 @@
   }
 
   // ── SPEECH ─────────────────────────────────────────────────────────────────
+  // Speech normally goes to the browser's online service. Some laptops can't reach it
+  // (Edge and Brave often fail with "network", as do some office networks/VPNs).
+  // On a network error the page switches to on-device recognition (Chrome 139+),
+  // downloading the voice pack once if needed, and remembers that choice.
+  const SPEECH_LANG = 'en-US';
+  let useLocalSpeech = false;
+  try { useLocalSpeech = localStorage.getItem('justsay-local-speech') === '1'; } catch(_) {}
+
+  function saveLocalSpeech(on) {
+    useLocalSpeech = on;
+    try { on ? localStorage.setItem('justsay-local-speech', '1') : localStorage.removeItem('justsay-local-speech'); } catch(_) {}
+  }
+
+  function localSpeechSupported() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    return !!(SR && typeof SR.available === 'function' && 'processLocally' in SR.prototype);
+  }
+
+  async function prepareLocalSpeech() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const opts = { langs: [SPEECH_LANG], processLocally: true };
+    const st = await SR.available(opts);
+    if (st === 'available') return true;
+    if (st === 'downloadable' || st === 'downloading') {
+      setStatus('Downloading on-device voice pack (one time)…', 'searching');
+      return await SR.install(opts);
+    }
+    return false;
+  }
+
+  function onNetworkSpeechError() {
+    if (useLocalSpeech || !localSpeechSupported()) {
+      saveLocalSpeech(false);
+      setStatus('Voice service unreachable in this browser — use Chrome, or type the song', 'error');
+      return;
+    }
+    setStatus('Online voice blocked — switching to on-device voice…', 'searching');
+    prepareLocalSpeech().then(ok => {
+      if (!ok) { setStatus('Voice not available in this browser — use Chrome, or type the song', 'error'); return; }
+      saveLocalSpeech(true);
+      setStatus('On-device voice ready — tap the mic and speak', 'playing');
+    }).catch(() => setStatus('Voice not available in this browser — use Chrome, or type the song', 'error'));
+  }
+
   function setupRecognition() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) { setStatus('Voice not supported in Firefox — use Chrome or Edge', 'error'); return null; }
     const r = new SR();
-    r.lang = 'en-US'; r.continuous = false; r.interimResults = true; r.maxAlternatives = 1;
+    r.lang = SPEECH_LANG; r.continuous = false; r.interimResults = true; r.maxAlternatives = 1;
+    if (useLocalSpeech && localSpeechSupported()) r.processLocally = true;
 
     r.onstart = () => { isListening = true; setMicState(true); setStatus('Listening…', 'listening'); };
 
@@ -425,7 +470,13 @@
 
     r.onerror = (e) => {
       isListening = false; setMicState(false);
-      const msgs = { 'no-speech': 'No speech — try again', 'not-allowed': 'Mic blocked — allow in browser settings', 'network': 'Network error' };
+      if (e.error === 'network') { onNetworkSpeechError(); return; }
+      if (useLocalSpeech && (e.error === 'language-not-supported' || e.error === 'service-not-allowed')) {
+        saveLocalSpeech(false);   // on-device didn't work here — go back to online voice next time
+        setStatus('On-device voice unavailable — tap the mic to try online voice', 'error');
+        return;
+      }
+      const msgs = { 'no-speech': 'No speech — try again', 'not-allowed': 'Mic blocked — allow in browser settings', 'audio-capture': 'No microphone found' };
       setStatus(msgs[e.error] || 'Mic error: ' + e.error, 'error');
     };
     r.onend = () => {
